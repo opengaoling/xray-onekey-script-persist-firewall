@@ -27,22 +27,19 @@ jobs:
 
       - name: Download Xray-core
         id: download
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           LATEST_TAG=${{ steps.get_latest_release.outputs.latest_tag }}
-          
-          # 下载常用架构
-          for ARCH in 64 32 arm64-v8a arm32-v7; do
-            FILE="Xray-linux-${ARCH}.zip"
-            URL="https://github.com/XTLS/Xray-core/releases/download/${LATEST_TAG}/${FILE}"
-            echo "Downloading $FILE..."
-            curl -sLo "$FILE" "$URL"
-          done
+          mkdir -p downloads
+          echo "Downloading all assets for tag ${LATEST_TAG}..."
+          gh release download "$LATEST_TAG" -R XTLS/Xray-core --dir downloads
 
       - name: Upload to release
         uses: svenstaro/upload-release-action@v2
         with:
           repo_token: ${{ secrets.GITHUB_TOKEN }}
-          file: Xray-linux-*.zip
+          file: downloads/*
           tag: ${{ steps.get_latest_release.outputs.latest_tag }}
           overwrite: true
           file_glob: true
