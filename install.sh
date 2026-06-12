@@ -449,7 +449,7 @@ open_port() {
         firewall-cmd --zone=public --add-port="$port"/tcp --permanent
         firewall-cmd --reload
     elif command -v iptables >/dev/null; then
-        iptables -I INPUT -p tcp --dport "$port" -j ACCEPT
+        add_iptables_port "$port"
     fi
 }
 
@@ -474,7 +474,93 @@ close_port() {
         firewall-cmd --zone=public --remove-port="$port"/tcp --permanent
         firewall-cmd --reload
     elif command -v iptables >/dev/null; then
-        iptables -D INPUT -p tcp --dport "$port" -j ACCEPT
+        remove_iptables_port "$port"
+    fi
+}
+
+add_iptables_port() {
+    local port=$1
+    local reject_line
+
+    if ! iptables -C INPUT -p tcp --dport "$port" -j ACCEPT >/dev/null 2>&1; then
+        reject_line=$(iptables -L INPUT -n -v --line-numbers | awk '$4 == "REJECT" {print $1; exit}')
+        if [[ -n "$reject_line" ]]; then
+            iptables -I INPUT "$reject_line" -p tcp --dport "$port" -j ACCEPT
+        else
+            iptables -I INPUT -p tcp --dport "$port" -j ACCEPT
+        fi
+    fi
+
+    persist_iptables_port "$port" add
+}
+
+remove_iptables_port() {
+    local port=$1
+
+    while iptables -C INPUT -p tcp --dport "$port" -j ACCEPT >/dev/null 2>&1; do
+        iptables -D INPUT -p tcp --dport "$port" -j ACCEPT || break
+    done
+
+    persist_iptables_port "$port" remove
+}
+
+persist_iptables_port() {
+    local port=$1
+    local action=$2
+    local rules_file="${IPTABLES_RULES_FILE:-/etc/iptables/rules.v4}"
+    local rule="-A INPUT -p tcp -m tcp --dport ${port} -j ACCEPT"
+    local tmp_file
+
+    [[ -z "$port" ]] && return
+
+    if [[ "$action" == "add" ]]; then
+        if [[ ! -f "$rules_file" ]]; then
+            if command -v iptables-save >/dev/null 2>&1; then
+                mkdir -p "$(dirname "$rules_file")"
+                iptables-save > "$rules_file"
+                validate_iptables_rules_file "$rules_file"
+            else
+                echo -e "${YELLOW}Warning: iptables-save not found. Port $port is open now but may not persist after reboot.${PLAIN}"
+            fi
+            return
+        fi
+
+        if grep -Fxq -- "$rule" "$rules_file"; then
+            return
+        fi
+
+        tmp_file=$(mktemp)
+        awk -v rule="$rule" '
+            !inserted && index($0, "-A INPUT ") == 1 && $0 ~ / -j REJECT/ {
+                print rule
+                inserted=1
+            }
+            !inserted && $0 == "COMMIT" {
+                print rule
+                inserted=1
+            }
+            { print }
+        ' "$rules_file" > "$tmp_file" && mv "$tmp_file" "$rules_file"
+        validate_iptables_rules_file "$rules_file"
+    elif [[ "$action" == "remove" && -f "$rules_file" ]]; then
+        tmp_file=$(mktemp)
+        grep -Fvx -- "$rule" "$rules_file" > "$tmp_file" || true
+        mv "$tmp_file" "$rules_file"
+        validate_iptables_rules_file "$rules_file"
+    fi
+}
+
+validate_iptables_rules_file() {
+    local rules_file=$1
+
+    if command -v iptables-restore >/dev/null 2>&1; then
+        if ! iptables-restore --test < "$rules_file" >/dev/null 2>&1; then
+            echo -e "${YELLOW}Warning: $rules_file failed iptables-restore validation. Runtime firewall rule was still applied.${PLAIN}"
+        fi
+    fi
+
+    if ! command -v netfilter-persistent >/dev/null 2>&1 && ! systemctl list-unit-files netfilter-persistent.service >/dev/null 2>&1; then
+        echo -e "${YELLOW}Warning: netfilter-persistent is not installed. Install iptables-persistent/netfilter-persistent if this system does not load $rules_file on boot.${PLAIN}"
     fi
 }
 
