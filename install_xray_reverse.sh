@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # =============================================================================
-# Xray-2go 原生反向代理（VMess + WS + CF 专用版）
-# 专为套 Cloudflare CDN 设计，支持双路径分流与内网穿透
+# Xray-2go 原生反向代理（VMess + WS/直连）
+# 支持 Cloudflare CDN 与直连 IP，使用 VMess 反代隧道做内网穿透
 # 版本: 1.5.0 (2026-04-28)
 # =============================================================================
 
@@ -104,6 +104,134 @@ detect_public_ip() {
     ip="$(curl -4fsS https://api.ipify.org 2>/dev/null || true)"
     [[ -n "$ip" ]] || ip="$(curl -4fsS https://ipv4.icanhazip.com 2>/dev/null || true)"
     printf '%s' "$ip" | tr -d '\r\n'
+}
+
+open_firewall_port() {
+    local port="$1"
+    [[ -z "$port" ]] && return
+
+    if [[ "$IS_ROOT" != "true" ]]; then
+        y "非 root 运行，未自动放行端口 ${port}/tcp；请手动放行该端口"
+        return
+    fi
+
+    info "放行端口 ${port}/tcp"
+
+    if command -v ufw >/dev/null 2>&1; then
+        ufw allow "${port}/tcp" >/dev/null
+        ufw reload >/dev/null || true
+    elif command -v firewall-cmd >/dev/null 2>&1; then
+        firewall-cmd --zone=public --add-port="${port}/tcp" --permanent >/dev/null
+        firewall-cmd --reload >/dev/null
+    elif command -v iptables >/dev/null 2>&1; then
+        add_iptables_port "$port"
+    else
+        y "未检测到可用防火墙命令，请手动放行 ${port}/tcp"
+    fi
+}
+
+close_firewall_port() {
+    local port="$1"
+    [[ -z "$port" ]] && return
+    [[ "$IS_ROOT" != "true" ]] && return
+
+    info "关闭端口 ${port}/tcp"
+
+    if command -v ufw >/dev/null 2>&1; then
+        ufw delete allow "${port}/tcp" >/dev/null 2>&1 || true
+        ufw reload >/dev/null 2>&1 || true
+    elif command -v firewall-cmd >/dev/null 2>&1; then
+        firewall-cmd --zone=public --remove-port="${port}/tcp" --permanent >/dev/null 2>&1 || true
+        firewall-cmd --reload >/dev/null 2>&1 || true
+    elif command -v iptables >/dev/null 2>&1; then
+        remove_iptables_port "$port"
+    fi
+}
+
+add_iptables_port() {
+    local port="$1"
+    local reject_line
+
+    if ! iptables -C INPUT -p tcp --dport "$port" -j ACCEPT >/dev/null 2>&1; then
+        reject_line="$(iptables -L INPUT -n -v --line-numbers | awk '$4 == "REJECT" {print $1; exit}')"
+        if [[ -n "$reject_line" ]]; then
+            iptables -I INPUT "$reject_line" -p tcp --dport "$port" -j ACCEPT
+        else
+            iptables -I INPUT -p tcp --dport "$port" -j ACCEPT
+        fi
+    fi
+
+    persist_iptables_port "$port" add
+}
+
+remove_iptables_port() {
+    local port="$1"
+
+    while iptables -C INPUT -p tcp --dport "$port" -j ACCEPT >/dev/null 2>&1; do
+        iptables -D INPUT -p tcp --dport "$port" -j ACCEPT || break
+    done
+
+    persist_iptables_port "$port" remove
+}
+
+persist_iptables_port() {
+    local port="$1"
+    local action="$2"
+    local rules_file="${IPTABLES_RULES_FILE:-/etc/iptables/rules.v4}"
+    local rule="-A INPUT -p tcp -m tcp --dport ${port} -j ACCEPT"
+    local tmp_file
+
+    [[ -z "$port" ]] && return
+
+    if [[ "$action" == "add" ]]; then
+        if [[ ! -f "$rules_file" ]]; then
+            if command -v iptables-save >/dev/null 2>&1; then
+                mkdir -p "$(dirname "$rules_file")"
+                iptables-save > "$rules_file"
+                validate_iptables_rules_file "$rules_file"
+            else
+                y "未找到 iptables-save，端口 ${port}/tcp 当前已放行但重启后可能失效"
+            fi
+            return
+        fi
+
+        if grep -Fxq -- "$rule" "$rules_file"; then
+            return
+        fi
+
+        tmp_file="$(mktemp)"
+        awk -v rule="$rule" '
+            !inserted && index($0, "-A INPUT ") == 1 && $0 ~ / -j REJECT/ {
+                print rule
+                inserted=1
+            }
+            !inserted && $0 == "COMMIT" {
+                print rule
+                inserted=1
+            }
+            { print }
+        ' "$rules_file" > "$tmp_file" && mv "$tmp_file" "$rules_file"
+        validate_iptables_rules_file "$rules_file"
+    elif [[ "$action" == "remove" && -f "$rules_file" ]]; then
+        tmp_file="$(mktemp)"
+        grep -Fvx -- "$rule" "$rules_file" > "$tmp_file" || true
+        mv "$tmp_file" "$rules_file"
+        validate_iptables_rules_file "$rules_file"
+    fi
+}
+
+validate_iptables_rules_file() {
+    local rules_file="$1"
+
+    if command -v iptables-restore >/dev/null 2>&1; then
+        if ! iptables-restore --test < "$rules_file" >/dev/null 2>&1; then
+            y "${rules_file} 未通过 iptables-restore 校验；运行时防火墙规则仍已应用"
+        fi
+    fi
+
+    if ! command -v netfilter-persistent >/dev/null 2>&1 && ! systemctl list-unit-files netfilter-persistent.service >/dev/null 2>&1; then
+        y "未检测到 netfilter-persistent；如系统启动时不加载 ${rules_file}，请安装 iptables-persistent/netfilter-persistent"
+    fi
 }
 
 generate_vmess_link() {
@@ -257,7 +385,7 @@ install_portal() {
     REV_DOMAIN="rev_${RAND_STR}.local"
 
     echo -e "\n请选择连接方式 (当前: ${CONN_MODE:-2}):"
-    echo -e "  1) ${CYAN}Cloudflare 模式${RESET} (WS + TLS, 单端口双路径, 适合套 CDN)"
+    echo -e "  1) ${CYAN}Cloudflare 模式${RESET} (VMess + WS + TLS, 单路径回源, 适合套 CDN)"
     echo -e "  2) ${CYAN}直连 IP 模式${RESET} (TCP, 双端口, 适合直接连接, 无需域名)"
     read -p "请选择 (1/2, 默认 ${CONN_MODE:-2}): " NEW_CONN_MODE
     CONN_MODE=${NEW_CONN_MODE:-${CONN_MODE:-2}}
@@ -267,14 +395,13 @@ install_portal() {
         read -p "请输入服务端监听端口 (默认 ${RANDOM_PORT}): " LISTEN_PORT
         LISTEN_PORT=${LISTEN_PORT:-${RANDOM_PORT}}
 
-        # 生成随机路径
+        # VMess+WS 入站使用同一个路径承载用户流量和 Bridge 隧道流量。
+        # 服务端通过 reverse domain 识别隧道连接，不能依赖 routing.path 做分流。
         RAND_USER=$(head /dev/urandom | tr -dc a-z0-9 | head -c 6)
-        RAND_TUNNEL=$(head /dev/urandom | tr -dc a-z0-9 | head -c 6)
 
-        read -p "请输入用户访问路径 (默认 /user_${RAND_USER}): " USER_PATH
-        USER_PATH=${USER_PATH:-/user_${RAND_USER}}
-        read -p "请输入隧道连接路径 (默认 /tunnel_${RAND_TUNNEL}): " TUNNEL_PATH
-        TUNNEL_PATH=${TUNNEL_PATH:-/tunnel_${RAND_TUNNEL}}
+        read -p "请输入 VMess WS 路径 (默认 /vmess_${RAND_USER}): " USER_PATH
+        USER_PATH=${USER_PATH:-/vmess_${RAND_USER}}
+        TUNNEL_PATH=${USER_PATH}
         read -p "请输入用于客户端连接的域名: " SHARE_DOMAIN
         [[ -z "${SHARE_DOMAIN}" ]] && fail "必须输入用于客户端连接的域名"
     else
@@ -307,12 +434,12 @@ install_portal() {
     {
       "tag": "ext_in", "port": ${LISTEN_PORT}, "protocol": "vmess",
       "settings": { "clients": [{ "id": "${UUID}", "alterId": 0, "security": "aes-128-gcm" }] },
-      "streamSettings": { "network": "ws" }
+      "streamSettings": { "network": "ws", "wsSettings": { "path": "${USER_PATH}" } }
     }
   ],
   "routing": {
     "rules": [
-      { "type": "field", "path": ["${USER_PATH}", "${TUNNEL_PATH}"], "outboundTag": "portal" },
+      { "type": "field", "domain": ["full:${REV_DOMAIN}"], "outboundTag": "portal" },
       { "type": "field", "inboundTag": ["ext_in"], "outboundTag": "portal" }
     ]
   },
@@ -329,16 +456,23 @@ EOF
   "reverse": { "portals": [{ "tag": "portal", "domain": "${REV_DOMAIN}" }] },
   "inbounds": [
     { "tag": "ext_in", "port": ${EXT_PORT}, "protocol": "vmess", "settings": { "clients": [{ "id": "${UUID}", "alterId": 0, "security": "aes-128-gcm" }] } },
-    { "tag": "tunnel_in", "port": ${TUNNEL_PORT}, "protocol": "shadowsocks", "settings": { "method": "aes-128-gcm", "password": "${UUID}", "network": "tcp,udp" } }
+    { "tag": "tunnel_in", "port": ${TUNNEL_PORT}, "protocol": "vmess", "settings": { "clients": [{ "id": "${UUID}", "alterId": 0, "security": "aes-128-gcm" }] } }
   ],
   "routing": {
     "rules": [
+      { "type": "field", "domain": ["full:${REV_DOMAIN}"], "outboundTag": "portal" },
       { "type": "field", "inboundTag": ["ext_in", "tunnel_in"], "outboundTag": "portal" }
     ]
   },
   "outbounds": [{ "protocol": "freedom", "tag": "direct" }]
 }
 EOF
+    fi
+    if [[ "$CONN_MODE" == "1" ]]; then
+        open_firewall_port "$LISTEN_PORT"
+    else
+        open_firewall_port "$EXT_PORT"
+        open_firewall_port "$TUNNEL_PORT"
     fi
     setup_service
     if [[ "$CONN_MODE" == "1" ]]; then
@@ -352,8 +486,7 @@ EOF
         echo -e "客户端导入串: ${GREEN}${IMPORT_TOKEN}${RESET}"
         echo -e "\n--- 其它详细参数 ---"
         echo -e "UUID: ${PURPLE}${UUID}${RESET}"
-        echo -e "用户路径: ${CYAN}${USER_PATH}${RESET}"
-        echo -e "隧道路径: ${CYAN}${TUNNEL_PATH}${RESET}"
+        echo -e "VMess WS 路径: ${CYAN}${USER_PATH}${RESET}"
         echo -e "识别域名: ${CYAN}${REV_DOMAIN}${RESET}"
         echo -e "V2rayN 链接: ${GREEN}${VMESS_LINK}${RESET}"
         echo -e "-------------------------------------------------"
@@ -416,8 +549,8 @@ install_bridge() {
 
     if [[ "$CONN_MODE" == "1" ]]; then
         if [[ -z "${TUNNEL_PATH:-}" ]]; then
-            read -p "请输入隧道连接路径 (默认 /tunnel): " TUNNEL_PATH
-            TUNNEL_PATH=${TUNNEL_PATH:-/tunnel}
+            read -p "请输入 VMess WS 路径 (默认 /vmess): " TUNNEL_PATH
+            TUNNEL_PATH=${TUNNEL_PATH:-/vmess}
         fi
         STREAM_SETTINGS="{\"network\": \"ws\", \"security\": \"tls\", \"tlsSettings\": {\"serverName\": \"${SERVER_ADDR}\"}, \"wsSettings\": {\"path\": \"${TUNNEL_PATH}\"}}"
         SERVER_PORT=443
@@ -463,11 +596,11 @@ install_bridge() {
   "reverse": { "bridges": [{ "tag": "bridge", "domain": "${REV_DOMAIN}" }] },
   "outbounds": [
     {
-      "tag": "tunnel_out", "protocol": "shadowsocks",
-      "settings": { "servers": [{ "address": "${SERVER_ADDR}", "port": ${SERVER_PORT}, "method": "aes-128-gcm", "password": "${UUID}" }] },
+      "tag": "tunnel_out", "protocol": "vmess",
+      "settings": { "vnext": [{ "address": "${SERVER_ADDR}", "port": ${SERVER_PORT}, "users": [{ "id": "${UUID}", "alterId": 0, "security": "aes-128-gcm" }] }] },
       "streamSettings": ${STREAM_SETTINGS}
     },
-    { "tag": "local_service", "protocol": "freedom", "settings": { "domainStrategy": "UseIP" } },
+    { "tag": "local_service", "protocol": "freedom", "settings": ${OUTBOUND_SETTINGS} },
     { "tag": "direct", "protocol": "freedom", "settings": { "domainStrategy": "UseIP" } }
   ],
   "routing": {
@@ -503,6 +636,11 @@ show_status() {
 uninstall() {
     read -p "确定要卸载吗？(y/n): " confirm
     [[ "$confirm" != "y" ]] && return
+    if [[ -f "$CONFIG_FILE" ]]; then
+        jq -r '.inbounds[]?.port // empty' "$CONFIG_FILE" | while read -r port; do
+            close_firewall_port "$port"
+        done
+    fi
     if has_user_systemd; then
         run_user_systemctl stop xray-rev >/dev/null 2>&1 || true
         run_user_systemctl disable xray-rev >/dev/null 2>&1 || true
@@ -522,7 +660,7 @@ uninstall() {
 # -----------------------------------------------------------------------------
 
 main_menu() {
-    clear
+    clear 2>/dev/null || true
     p "================================================="
     p "    Xray 原生反代 (VMess+WS+CF) 一键管理脚本     "
     p "              版本: 1.5.0 (2026-04-28)           "
@@ -564,15 +702,9 @@ add_portal_client() {
     read -p "请输入新客户端的识别域名 (如 reverse2.local): " NEW_REV_DOMAIN
     [[ -z "${NEW_REV_DOMAIN}" ]] && fail "必须输入域名"
     
-    RAND_USER=$(head /dev/urandom | tr -dc a-z0-9 | head -c 6)
-    read -p "请输入该客户端的用户访问路径 (默认 /user_${RAND_USER}): " NEW_USER_PATH
-    NEW_USER_PATH=${NEW_USER_PATH:-/user_${RAND_USER}}
-    
     NEW_TUNNEL_PATH=""
     if [[ "$CONN_MODE" == "1" ]]; then
-        RAND_TUNNEL=$(head /dev/urandom | tr -dc a-z0-9 | head -c 6)
-        read -p "请输入该客户端的隧道连接路径 (默认 /tunnel_${RAND_TUNNEL}): " NEW_TUNNEL_PATH
-        NEW_TUNNEL_PATH=${NEW_TUNNEL_PATH:-/tunnel_${RAND_TUNNEL}}
+        NEW_TUNNEL_PATH=$(jq -r '.inbounds[] | select(.tag=="ext_in") | .streamSettings.wsSettings.path // empty' "$CONFIG_FILE" | head -n 1)
     fi
 
     NEW_TAG="portal_$(date +%s)"
@@ -581,11 +713,11 @@ add_portal_client() {
     tmp_config="${CONFIG_FILE}.tmp"
     if [[ "$CONN_MODE" == "1" ]]; then
         jq ".reverse.portals += [{\"tag\": \"${NEW_TAG}\", \"domain\": \"${NEW_REV_DOMAIN}\"}] | 
-            .routing.rules = [{\"type\": \"field\", \"path\": [\"${NEW_USER_PATH}\", \"${NEW_TUNNEL_PATH}\"], \"outboundTag\": \"${NEW_TAG}\"}] + .routing.rules" \
+            .routing.rules = [{\"type\": \"field\", \"domain\": [\"full:${NEW_REV_DOMAIN}\"], \"outboundTag\": \"${NEW_TAG}\"}] + .routing.rules" \
             "$CONFIG_FILE" > "$tmp_config" && mv "$tmp_config" "$CONFIG_FILE"
     else
         jq ".reverse.portals += [{\"tag\": \"${NEW_TAG}\", \"domain\": \"${NEW_REV_DOMAIN}\"}] | 
-            .routing.rules = [{\"type\": \"field\", \"path\": [\"${NEW_USER_PATH}\"], \"outboundTag\": \"${NEW_TAG}\"}] + .routing.rules" \
+            .routing.rules = [{\"type\": \"field\", \"domain\": [\"full:${NEW_REV_DOMAIN}\"], \"outboundTag\": \"${NEW_TAG}\"}] + .routing.rules" \
             "$CONFIG_FILE" > "$tmp_config" && mv "$tmp_config" "$CONFIG_FILE"
     fi
 
@@ -603,8 +735,7 @@ add_portal_client() {
     g "\n✅ 客户端添加成功！"
     echo -e "-------------------------------------------------"
     echo -e "识别域名: ${CYAN}${NEW_REV_DOMAIN}${RESET}"
-    echo -e "用户访问路径: ${CYAN}${NEW_USER_PATH}${RESET}"
-    [[ -n "$NEW_TUNNEL_PATH" ]] && echo -e "隧道连接路径: ${CYAN}${NEW_TUNNEL_PATH}${RESET}"
+    [[ -n "$NEW_TUNNEL_PATH" ]] && echo -e "VMess WS 路径: ${CYAN}${NEW_TUNNEL_PATH}${RESET}"
     echo -e "\n${BOLD}--- 客户端一键配置 ---${RESET}"
     echo -e "客户端导入串: ${GREEN}${IMPORT_TOKEN}${RESET}"
     echo -e "-------------------------------------------------"
@@ -646,6 +777,7 @@ manage_vmess_mapping() {
                 .routing.rules = [{\"type\": \"field\", \"inboundTag\": [\"${MAP_TAG}\"], \"outboundTag\": \"${TARGET_TAG}\"}] + .routing.rules" \
                 "$CONFIG_FILE" > "$tmp_config" && mv "$tmp_config" "$CONFIG_FILE"
             
+            open_firewall_port "$NEW_PORT"
             restart_service
             g "✅ 映射添加成功！端口 ${NEW_PORT} -> 客户端 ${TARGET_DOMAIN}"
             ;;
@@ -662,6 +794,7 @@ manage_vmess_mapping() {
                 del(.routing.rules[] | select(.inboundTag != null and .inboundTag[0] == \"${MAP_TAG}\"))" \
                 "$CONFIG_FILE" > "$tmp_config" && mv "$tmp_config" "$CONFIG_FILE"
             
+            close_firewall_port "$DEL_PORT"
             restart_service
             g "✅ 映射端口 ${DEL_PORT} 已删除"
             ;;
@@ -686,8 +819,7 @@ show_config() {
             
             echo -e "\n[ 客户端: ${CYAN}${domain}${RESET} ]"
             if [[ "$CONN_MODE" == "1" ]]; then
-                # 获取该 tag 对应的隧道路径 (通常是 rules 中 path 列表的最后一个)
-                local tunnel_path=$(jq -r ".routing.rules[] | select(.outboundTag==\"$tag\") | .path | if type==\"array\" then .[-1] else . end" "$CONFIG_FILE" | head -n 1)
+                local tunnel_path=$(jq -r '.inbounds[] | select(.tag=="ext_in") | .streamSettings.wsSettings.path // empty' "$CONFIG_FILE" | head -n 1)
                 local token=$(build_client_import_token "$CONN_MODE" "$UUID" "$SERVER_ADDR" "443" "$domain" "$tunnel_path")
                 echo -e "导入串: ${GREEN}${token}${RESET}"
             else
