@@ -33,6 +33,9 @@ fail()  { echo -e "${RED}└─ ✗ $*${RESET}" >&2; exit 1; }
 STEP_NUM=1
 IS_ROOT=false
 [[ $EUID -eq 0 ]] && IS_ROOT=true
+OS_NAME="$(uname -s)"
+IS_MACOS=false
+[[ "$OS_NAME" == "Darwin" ]] && IS_MACOS=true
 
 # 目录与路径
 LOOKUP_USER="${SUDO_USER:-$(id -un)}"
@@ -49,10 +52,13 @@ fi
 WORK_DIR="${TARGET_HOME}/.local/share/xray-rev"
 XRAY_BIN="${TARGET_HOME}/.local/bin/xray-rev"
 CONFIG_FILE="${WORK_DIR}/config.json"
+LAUNCHD_FILE="${TARGET_HOME}/Library/LaunchAgents/com.xray.reverse.plist"
 
 # 检查权限与 systemd
 HAS_SYSTEMD=false
-command -v systemctl >/dev/null 2>&1 && HAS_SYSTEMD=true
+if ! $IS_MACOS; then
+    command -v systemctl >/dev/null 2>&1 && HAS_SYSTEMD=true
+fi
 SYSTEMCTL_CMD="systemctl --user"
 USER_SYSTEMD_UID=""
 if [[ "$IS_ROOT" == "true" && -n "${SUDO_USER:-}" ]]; then
@@ -81,11 +87,19 @@ install_xray() {
     step "下载并安装 Xray-core"
     mkdir -p "${WORK_DIR}"
     ARCH_RAW="$(uname -m)"
-    case "${ARCH_RAW}" in
-        'x86_64') XRAY_ASSET="Xray-linux-64.zip" ;;
-        'aarch64'|'arm64') XRAY_ASSET="Xray-linux-arm64-v8a.zip" ;;
-        *) XRAY_ASSET="Xray-linux-64.zip" ;;
-    esac
+    if $IS_MACOS; then
+        case "${ARCH_RAW}" in
+            'x86_64') XRAY_ASSET="Xray-macos-64.zip" ;;
+            'arm64'|'aarch64') XRAY_ASSET="Xray-macos-arm64-v8a.zip" ;;
+            *) fail "macOS 暂不支持该架构: ${ARCH_RAW}" ;;
+        esac
+    else
+        case "${ARCH_RAW}" in
+            'x86_64') XRAY_ASSET="Xray-linux-64.zip" ;;
+            'aarch64'|'arm64') XRAY_ASSET="Xray-linux-arm64-v8a.zip" ;;
+            *) XRAY_ASSET="Xray-linux-64.zip" ;;
+        esac
+    fi
 
     URL="https://github.com/opengaoling/xray-onekey-script-persist-firewall/releases/latest/download/${XRAY_ASSET}"
     curl -fL -o "${WORK_DIR}/xray.zip" "${URL}"
@@ -109,6 +123,11 @@ detect_public_ip() {
 open_firewall_port() {
     local port="$1"
     [[ -z "$port" ]] && return
+
+    if $IS_MACOS; then
+        y "macOS detected. 请在系统防火墙中允许 Xray 入站连接，或按需手动配置 pf 放行 ${port}/tcp"
+        return
+    fi
 
     if [[ "$IS_ROOT" != "true" ]]; then
         y "非 root 运行，未自动放行端口 ${port}/tcp；请手动放行该端口"
@@ -134,6 +153,7 @@ close_firewall_port() {
     local port="$1"
     [[ -z "$port" ]] && return
     [[ "$IS_ROOT" != "true" ]] && return
+    $IS_MACOS && return
 
     info "关闭端口 ${port}/tcp"
 
@@ -229,7 +249,7 @@ validate_iptables_rules_file() {
         fi
     fi
 
-    if ! command -v netfilter-persistent >/dev/null 2>&1 && ! systemctl list-unit-files netfilter-persistent.service >/dev/null 2>&1; then
+    if command -v systemctl >/dev/null 2>&1 && ! command -v netfilter-persistent >/dev/null 2>&1 && ! systemctl list-unit-files netfilter-persistent.service >/dev/null 2>&1; then
         y "未检测到 netfilter-persistent；如系统启动时不加载 ${rules_file}，请安装 iptables-persistent/netfilter-persistent"
     fi
 }
@@ -292,7 +312,11 @@ parse_client_import_token() {
 
     [[ "$import_token" == xrayrev://v1/* ]] || return 1
     encoded_payload="${import_token#xrayrev://v1/}"
-    payload="$(printf '%s' "$encoded_payload" | sed 's/-/+/g; s/_/\//g' | base64 -d 2>/dev/null)" || return 1
+    if base64 --help 2>&1 | grep -q -- '-d'; then
+        payload="$(printf '%s' "$encoded_payload" | sed 's/-/+/g; s/_/\//g' | base64 -d 2>/dev/null)" || return 1
+    else
+        payload="$(printf '%s' "$encoded_payload" | sed 's/-/+/g; s/_/\//g' | base64 -D 2>/dev/null)" || return 1
+    fi
     parsed="$(printf '%s' "$payload" | jq -er '[.ver, .conn_mode, .uuid, .server_addr, .server_port, .rev_domain, (.tunnel_path // "")] | @tsv' 2>/dev/null)" || return 1
 
     IFS=$'\t' read -r token_ver parsed_conn_mode parsed_uuid parsed_server_addr parsed_server_port parsed_rev_domain parsed_tunnel_path <<< "$parsed"
@@ -325,7 +349,9 @@ get_server_config() {
 
 cleanup_old_service() {
     # 停止并清理旧版本的 Xray 反代服务，确保新配置被干净加载
-    if has_user_systemd 2>/dev/null; then
+    if $IS_MACOS; then
+        launchctl unload -w "$LAUNCHD_FILE" >/dev/null 2>&1 || true
+    elif has_user_systemd 2>/dev/null; then
         run_user_systemctl stop xray-rev >/dev/null 2>&1 || true
         run_user_systemctl disable xray-rev >/dev/null 2>&1 || true
     fi
@@ -344,7 +370,36 @@ setup_service() {
     cleanup_old_service
     mkdir -p "$(dirname "$XRAY_BIN")"
     mkdir -p "${TARGET_HOME}/.config/systemd/user"
-    if has_user_systemd; then
+    if $IS_MACOS; then
+        mkdir -p "$(dirname "$LAUNCHD_FILE")" "${WORK_DIR}"
+        cat > "$LAUNCHD_FILE" << EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.xray.reverse</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>${XRAY_BIN}</string>
+        <string>run</string>
+        <string>-c</string>
+        <string>${CONFIG_FILE}</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>${WORK_DIR}/launchd.log</string>
+    <key>StandardErrorPath</key>
+    <string>${WORK_DIR}/launchd.err</string>
+</dict>
+</plist>
+EOF
+        launchctl load -w "$LAUNCHD_FILE"
+        ok "macOS launchd 用户服务已启动并设为开机自启"
+    elif has_user_systemd; then
         SVCPATH="${TARGET_HOME}/.config/systemd/user"
         cat > "$SVCPATH/xray-rev.service" << EOF
 [Unit]
@@ -626,7 +681,9 @@ EOF
 # -----------------------------------------------------------------------------
 
 show_status() {
-    if has_user_systemd; then
+    if $IS_MACOS; then
+        launchctl list com.xray.reverse >/dev/null 2>&1 && g "Xray 正在运行 (launchd)" || r "Xray 已停止"
+    elif has_user_systemd; then
         run_user_systemctl status xray-rev --no-pager || y "服务未运行"
     else
         pgrep -f "${XRAY_BIN}" > /dev/null && g "Xray 正在运行" || r "Xray 已停止"
@@ -641,7 +698,10 @@ uninstall() {
             close_firewall_port "$port"
         done
     fi
-    if has_user_systemd; then
+    if $IS_MACOS; then
+        launchctl unload -w "$LAUNCHD_FILE" >/dev/null 2>&1 || true
+        rm -f "$LAUNCHD_FILE"
+    elif has_user_systemd; then
         run_user_systemctl stop xray-rev >/dev/null 2>&1 || true
         run_user_systemctl disable xray-rev >/dev/null 2>&1 || true
         rm -f "$TARGET_HOME/.config/systemd/user/xray-rev.service"
@@ -840,6 +900,14 @@ show_config() {
 # 检查环境并启动
 command -v curl &>/dev/null || fail "缺少 curl，请先安装"
 command -v unzip &>/dev/null || fail "缺少 unzip，请先安装"
-command -v jq &>/dev/null || (if $IS_ROOT; then apt-get update -qq && apt-get install -y -qq jq; else fail "缺少 jq，请先安装"; fi)
+if ! command -v jq &>/dev/null; then
+    if $IS_MACOS; then
+        fail "缺少 jq，请先运行: brew install jq"
+    elif $IS_ROOT; then
+        apt-get update -qq && apt-get install -y -qq jq
+    else
+        fail "缺少 jq，请先安装"
+    fi
+fi
 
 main_menu

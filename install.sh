@@ -11,8 +11,18 @@ PLAIN="\033[0m"
 # root 检查与权限变量
 IS_ROOT=false
 [[ $EUID -eq 0 ]] && IS_ROOT=true
+OS_NAME="$(uname -s)"
+IS_MACOS=false
+[[ "$OS_NAME" == "Darwin" ]] && IS_MACOS=true
 
-if $IS_ROOT; then
+if $IS_MACOS; then
+    XRAY_BIN_DIR="$HOME/.local/bin"
+    XRAY_BIN_PATH="${XRAY_BIN_DIR}/xray"
+    XRAY_ETC_DIR="$HOME/.local/share/xray"
+    XRAY_LOG_DIR="$HOME/.local/state/xray/log"
+    XRAY_SHORTCUT_PATH="${XRAY_BIN_DIR}/xr"
+    LAUNCHD_FILE="$HOME/Library/LaunchAgents/com.xray.service.plist"
+elif $IS_ROOT; then
     XRAY_BIN_DIR="/usr/local/bin"
     XRAY_BIN_PATH="${XRAY_BIN_DIR}/xray"
     XRAY_ETC_DIR="/usr/local/etc/xray"
@@ -49,6 +59,27 @@ check_root() {
 
 install_dependencies() {
     echo -e "${YELLOW}Installing dependencies...${PLAIN}"
+    if $IS_MACOS; then
+        for cmd in curl unzip jq; do
+            if ! command -v "$cmd" >/dev/null 2>&1; then
+                if [[ "$cmd" == "jq" ]]; then
+                    echo -e "${RED}Error: Dependency 'jq' not found. Please install it with: brew install jq${PLAIN}"
+                else
+                    echo -e "${RED}Error: Dependency '$cmd' not found. Please install it manually.${PLAIN}"
+                fi
+                exit 1
+            fi
+        done
+        if ! command -v wget >/dev/null 2>&1; then
+            echo -e "${YELLOW}Warning: 'wget' not found. 'xr' shortcut will be created with curl.${PLAIN}"
+        fi
+        if ! command -v qrencode >/dev/null 2>&1; then
+            echo -e "${YELLOW}Warning: 'qrencode' not found. QR code display will be skipped.${PLAIN}"
+        fi
+        echo -e "${GREEN}Dependencies check completed.${PLAIN}"
+        return
+    fi
+
     if $IS_ROOT; then
         if [[ -f /etc/debian_version ]]; then
             apt-get update
@@ -92,16 +123,24 @@ install_xray_core() {
     echo -e "${GREEN}Latest version: ${LATEST_VER}${PLAIN}"
     
     ARCH=$(uname -m)
+    OS_ASSET="linux"
+    if $IS_MACOS; then
+        OS_ASSET="macos"
+    fi
     case $ARCH in
         x86_64) ARCH="64" ;;
-        aarch64) ARCH="arm64-v8a" ;;
+        aarch64|arm64) ARCH="arm64-v8a" ;;
         *) echo -e "${RED}Unsupported architecture: $ARCH${PLAIN}"; exit 1 ;;
     esac
 
-    DOWNLOAD_URL="https://github.com/opengaoling/xray-onekey-script-persist-firewall/releases/download/${LATEST_VER}/Xray-linux-${ARCH}.zip"
+    DOWNLOAD_URL="https://github.com/opengaoling/xray-onekey-script-persist-firewall/releases/download/${LATEST_VER}/Xray-${OS_ASSET}-${ARCH}.zip"
     
     mkdir -p /tmp/xray
-    wget -O /tmp/xray/xray.zip "$DOWNLOAD_URL"
+    if command -v wget >/dev/null 2>&1; then
+        wget -O /tmp/xray/xray.zip "$DOWNLOAD_URL"
+    else
+        curl -fL -o /tmp/xray/xray.zip "$DOWNLOAD_URL"
+    fi
     
     if [[ $? -ne 0 ]]; then
         echo -e "${RED}Download failed.${PLAIN}"
@@ -258,7 +297,36 @@ EOF
 setup_service() {
     echo -e "${YELLOW}Setting up Service...${PLAIN}"
     
-    if $IS_ROOT && [[ -f /etc/openwrt_release ]]; then
+    if $IS_MACOS; then
+        mkdir -p "$(dirname "$LAUNCHD_FILE")"
+        cat > "$LAUNCHD_FILE" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.xray.service</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>${XRAY_BIN_PATH}</string>
+        <string>run</string>
+        <string>-config</string>
+        <string>${XRAY_CONFIG_FILE}</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>${XRAY_LOG_DIR}/launchd.log</string>
+    <key>StandardErrorPath</key>
+    <string>${XRAY_LOG_DIR}/launchd.err</string>
+</dict>
+</plist>
+EOF
+        launchctl unload -w "$LAUNCHD_FILE" >/dev/null 2>&1 || true
+        launchctl load -w "$LAUNCHD_FILE"
+    elif $IS_ROOT && [[ -f /etc/openwrt_release ]]; then
         cat > "/etc/init.d/xray" <<EOF
 #!/bin/sh /etc/rc.common
 START=99
@@ -339,7 +407,10 @@ EOF
 }
 
 is_running() {
-    if [[ -f "$SYSTEMD_FILE" ]]; then
+    if $IS_MACOS; then
+        launchctl list com.xray.service >/dev/null 2>&1
+        return $?
+    elif [[ -f "$SYSTEMD_FILE" ]]; then
         $SYSTEMCTL_CMD is-active xray >/dev/null 2>&1
         return $?
     else
@@ -352,7 +423,11 @@ is_running() {
 create_shortcut() {
     echo -e "${YELLOW}Creating shortcut 'xr'...${PLAIN}"
     mkdir -p "$(dirname "$XRAY_SHORTCUT_PATH")"
-    wget -O "$XRAY_SHORTCUT_PATH" https://raw.githubusercontent.com/opengaoling/xray-onekey-script-persist-firewall/main/install.sh
+    if command -v wget >/dev/null 2>&1; then
+        wget -O "$XRAY_SHORTCUT_PATH" https://raw.githubusercontent.com/opengaoling/xray-onekey-script-persist-firewall/main/install.sh
+    else
+        curl -fL -o "$XRAY_SHORTCUT_PATH" https://raw.githubusercontent.com/opengaoling/xray-onekey-script-persist-firewall/main/install.sh
+    fi
     chmod +x "$XRAY_SHORTCUT_PATH"
     echo -e "${GREEN}Shortcut 'xr' created. You can run this script by typing 'xr'.${PLAIN}"
     if ! $IS_ROOT; then
@@ -362,7 +437,10 @@ create_shortcut() {
 
 restart_service() {
     echo -e "${YELLOW}Restarting Xray service...${PLAIN}"
-    if $IS_ROOT && ([[ -f /etc/openwrt_release ]] || [[ -f /etc/alpine-release ]]); then
+    if $IS_MACOS; then
+        launchctl unload -w "$LAUNCHD_FILE" >/dev/null 2>&1 || true
+        launchctl load -w "$LAUNCHD_FILE"
+    elif $IS_ROOT && ([[ -f /etc/openwrt_release ]] || [[ -f /etc/alpine-release ]]); then
         /etc/init.d/xray restart
     else
         $SYSTEMCTL_CMD restart xray
@@ -400,7 +478,7 @@ show_info() {
     REMARK=$(curl -sm 3 -H "User-Agent: Mozilla/5.0" "https://api.ip.sb/geoip" | tr -d '\n' | awk -F\" '{c="";i="";for(x=1;x<=NF;x++){if($x=="country_code")c=$(x+2);if($x=="isp")i=$(x+2)};if(c&&i)print c"-"i}' | sed 's/ /_/g' || curl -sm 3 -H "User-Agent: Mozilla/5.0" "https://ipapi.co/json" | tr -d '\n' | awk -F\" '{c="";o="";for(x=1;x<=NF;x++){if($x=="country_code")c=$(x+2);if($x=="org")o=$(x+2)};if(c&&o)print c"-"o}' | sed 's/ /_/g' || echo "VPS")
 
     SHARE_LINK="vless://${UUID}@${IP}:${PORT}?security=reality&encryption=none&pbk=${PUBLIC_KEY}&headerType=none&fp=chrome&type=tcp&flow=xtls-rprx-vision&sni=${DEST}&sid=${SHORT_ID}&spx=%2F#${REMARK}"
-    VMESS_SHARE_LINK=$(echo -n "{\"v\":\"2\",\"ps\":\"${REMARK}_vmess\",\"add\":\"${IP}\",\"port\":\"${VMESS_PORT}\",\"id\":\"${VMESS_UUID}\",\"aid\":\"0\",\"scy\":\"aes-128-gcm\",\"net\":\"tcp\",\"type\":\"none\",\"host\":\"\",\"path\":\"\",\"tls\":\"\",\"sni\":\"\",\"alpn\":\"\"}" | base64 -w 0)
+    VMESS_SHARE_LINK=$(printf '%s' "{\"v\":\"2\",\"ps\":\"${REMARK}_vmess\",\"add\":\"${IP}\",\"port\":\"${VMESS_PORT}\",\"id\":\"${VMESS_UUID}\",\"aid\":\"0\",\"scy\":\"aes-128-gcm\",\"net\":\"tcp\",\"type\":\"none\",\"host\":\"\",\"path\":\"\",\"tls\":\"\",\"sni\":\"\",\"alpn\":\"\"}" | base64 | tr -d '\r\n')
     VMESS_LINK="vmess://${VMESS_SHARE_LINK}"
 
     if command -v qrencode >/dev/null; then
@@ -425,6 +503,11 @@ show_info() {
 open_port() {
     local port=$1
     [[ -z "$port" ]] && return
+
+    if $IS_MACOS; then
+        echo -e "${YELLOW}macOS detected. Please allow incoming connections for Xray in System Settings > Network > Firewall, or configure pf manually if needed.${PLAIN}"
+        return
+    fi
 
     if ! $IS_ROOT; then
         echo -e "${YELLOW}Skipping port opening (requires root). Please ensure port $port is open in your firewall.${PLAIN}"
@@ -460,6 +543,8 @@ close_port() {
     if ! $IS_ROOT; then
         return
     fi
+
+    $IS_MACOS && return
 
     echo -e "${YELLOW}Closing port $port...${PLAIN}"
 
@@ -559,7 +644,7 @@ validate_iptables_rules_file() {
         fi
     fi
 
-    if ! command -v netfilter-persistent >/dev/null 2>&1 && ! systemctl list-unit-files netfilter-persistent.service >/dev/null 2>&1; then
+    if command -v systemctl >/dev/null 2>&1 && ! command -v netfilter-persistent >/dev/null 2>&1 && ! systemctl list-unit-files netfilter-persistent.service >/dev/null 2>&1; then
         echo -e "${YELLOW}Warning: netfilter-persistent is not installed. Install iptables-persistent/netfilter-persistent if this system does not load $rules_file on boot.${PLAIN}"
     fi
 }
@@ -592,7 +677,10 @@ uninstall_xray() {
         done
     fi
 
-    if $IS_ROOT && ([[ -f /etc/openwrt_release ]] || [[ -f /etc/alpine-release ]]); then
+    if $IS_MACOS; then
+        launchctl unload -w "$LAUNCHD_FILE" >/dev/null 2>&1 || true
+        rm -f "$LAUNCHD_FILE"
+    elif $IS_ROOT && ([[ -f /etc/openwrt_release ]] || [[ -f /etc/alpine-release ]]); then
         /etc/init.d/xray stop
         if command -v rc-update >/dev/null; then
             rc-update del xray default
@@ -689,6 +777,10 @@ change_sni() {
 }
 
 toggle_bbr() {
+    if $IS_MACOS; then
+        echo -e "${YELLOW}BBR toggle is only supported on Linux.${PLAIN}"
+        return
+    fi
     if ! $IS_ROOT; then
         echo -e "${RED}Error: Modifying BBR requires root privileges.${PLAIN}"
         return
@@ -711,7 +803,7 @@ toggle_bbr() {
 }
 
 menu() {
-    clear
+    clear 2>/dev/null || true
     echo -e "Xray Reality Management Script"
     echo -e "--------------------------------"
     if is_running; then
@@ -725,7 +817,7 @@ menu() {
     echo -e "3. Change Port"
     echo -e "4. Change SNI"
     echo -e "5. Show Info"
-    if grep -q "net.ipv4.tcp_congestion_control=bbr" /etc/sysctl.conf 2>/dev/null; then
+    if ! $IS_MACOS && grep -q "net.ipv4.tcp_congestion_control=bbr" /etc/sysctl.conf 2>/dev/null; then
         echo -e "6. Disable BBR"
     else
         echo -e "6. Enable BBR"

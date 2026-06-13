@@ -58,6 +58,12 @@ curl -Ls https://raw.githubusercontent.com/opengaoling/xray-onekey-script-persis
 - 原生反代版会为直连模式端口和新增 VMess 映射端口同步运行时规则与 `/etc/iptables/rules.v4`。
 - 如果服务器在 Oracle Cloud、AWS、GCP 等云平台，还需要在云控制台的安全组/安全列表中放行对应 TCP 端口。
 
+## 🍎 macOS 支持
+
+- 常规交互版、原生反代版和 Argo 隧道版均支持 macOS Intel 与 Apple Silicon。
+- macOS 会下载 `Xray-macos-64.zip` 或 `Xray-macos-arm64-v8a.zip`，并使用用户级 `launchd` 服务管理进程。
+- macOS 不使用 iptables；如启用了系统防火墙，请在系统设置中允许 Xray 入站连接，或按需手动配置 `pf`。
+
 ---
 
 ## 📄 许可说明
