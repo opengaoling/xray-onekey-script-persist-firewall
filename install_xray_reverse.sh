@@ -87,7 +87,7 @@ install_xray() {
         *) XRAY_ASSET="Xray-linux-64.zip" ;;
     esac
 
-    URL="https://github.com/obkj/xray-onekey-script/releases/latest/download/${XRAY_ASSET}"
+    URL="https://github.com/opengaoling/xray-onekey-script-persist-firewall/releases/latest/download/${XRAY_ASSET}"
     curl -fL -o "${WORK_DIR}/xray.zip" "${URL}"
     unzip -o "${WORK_DIR}/xray.zip" -d "${WORK_DIR}/" > /dev/null 2>&1
     mkdir -p "$(dirname "${XRAY_BIN}")"

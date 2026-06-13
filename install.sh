@@ -83,7 +83,7 @@ install_dependencies() {
 install_xray_core() {
     echo -e "${YELLOW}Downloading Xray-core...${PLAIN}"
     # Get latest release version
-    LATEST_VER=$(curl -s https://api.github.com/repos/obkj/xray-onekey-script/releases/latest | jq -r .tag_name)
+    LATEST_VER=$(curl -s https://api.github.com/repos/opengaoling/xray-onekey-script-persist-firewall/releases/latest | jq -r .tag_name)
     if [[ -z "$LATEST_VER" ]]; then
         echo -e "${RED}Failed to fetch latest Xray version.${PLAIN}"
         exit 1
@@ -98,7 +98,7 @@ install_xray_core() {
         *) echo -e "${RED}Unsupported architecture: $ARCH${PLAIN}"; exit 1 ;;
     esac
 
-    DOWNLOAD_URL="https://github.com/obkj/xray-onekey-script/releases/download/${LATEST_VER}/Xray-linux-${ARCH}.zip"
+    DOWNLOAD_URL="https://github.com/opengaoling/xray-onekey-script-persist-firewall/releases/download/${LATEST_VER}/Xray-linux-${ARCH}.zip"
     
     mkdir -p /tmp/xray
     wget -O /tmp/xray/xray.zip "$DOWNLOAD_URL"
@@ -352,7 +352,7 @@ is_running() {
 create_shortcut() {
     echo -e "${YELLOW}Creating shortcut 'xr'...${PLAIN}"
     mkdir -p "$(dirname "$XRAY_SHORTCUT_PATH")"
-    wget -O "$XRAY_SHORTCUT_PATH" https://raw.githubusercontent.com/obkj/xray-onekey-script/main/install.sh
+    wget -O "$XRAY_SHORTCUT_PATH" https://raw.githubusercontent.com/opengaoling/xray-onekey-script-persist-firewall/main/install.sh
     chmod +x "$XRAY_SHORTCUT_PATH"
     echo -e "${GREEN}Shortcut 'xr' created. You can run this script by typing 'xr'.${PLAIN}"
     if ! $IS_ROOT; then

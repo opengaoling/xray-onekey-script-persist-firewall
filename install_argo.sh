@@ -261,7 +261,7 @@ info "安装目录 : ${WORK_DIR}"
 ok "目录准备完成"
 
 step "下载 Xray-core"
-XRAY_URL="https://github.com/obkj/xray-onekey-script/releases/latest/download/${XRAY_ASSET}"
+XRAY_URL="https://github.com/opengaoling/xray-onekey-script-persist-firewall/releases/latest/download/${XRAY_ASSET}"
 XRAY_ZIP="${WORK_DIR}/xray.zip"
 download_with_progress "$XRAY_URL" "$XRAY_ZIP" "Xray-core (${XRAY_ASSET})"
 
